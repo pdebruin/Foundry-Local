@@ -14,6 +14,7 @@ use super::model_variant::ModelVariant;
 use crate::error::{FoundryLocalError, Result};
 use crate::openai::AudioClient;
 use crate::openai::ChatClient;
+use crate::openai::LiveAudioTranscriptionSession;
 use crate::types::ModelInfo;
 
 /// The public model type.
@@ -240,6 +241,14 @@ impl Model {
     /// Create an [`AudioClient`] bound to the (selected) variant.
     pub fn create_audio_client(&self) -> AudioClient {
         self.selected_variant().create_audio_client()
+    }
+
+    /// Create a [`LiveAudioTranscriptionSession`] bound to the (selected) variant.
+    ///
+    /// Configure the session's [`settings`](LiveAudioTranscriptionSession::settings)
+    /// before calling [`start`](LiveAudioTranscriptionSession::start).
+    pub fn create_live_transcription_session(&self) -> LiveAudioTranscriptionSession {
+        self.selected_variant().create_live_transcription_session()
     }
 
     /// Available variants of this model.

@@ -1,6 +1,7 @@
 mod audio_client;
 mod chat_client;
 mod json_stream;
+mod live_audio_client;
 
 pub use self::audio_client::{
     AudioClient, AudioClientSettings, AudioTranscriptionResponse, AudioTranscriptionStream,
@@ -8,3 +9,7 @@ pub use self::audio_client::{
 };
 pub use self::chat_client::{ChatClient, ChatClientSettings, ChatCompletionStream};
 pub use self::json_stream::JsonStream;
+pub use self::live_audio_client::{
+    CoreErrorResponse, LiveAudioTranscriptionOptions, LiveAudioTranscriptionResponse,
+    LiveAudioTranscriptionSession, LiveAudioTranscriptionStream,
+};
