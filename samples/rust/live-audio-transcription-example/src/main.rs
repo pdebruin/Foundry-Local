@@ -27,10 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     // ── 1. Resolve e2e-test-pkgs path ────────────────────────────────────
-    let exe_dir = env::current_exe()?
-        .parent()
-        .unwrap()
-        .to_path_buf();
+    let exe_dir = env::current_exe()?.parent().unwrap().to_path_buf();
 
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let e2e_pkgs = std::path::PathBuf::from(manifest_dir)
@@ -73,8 +70,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !model.is_cached().await? {
         println!("Downloading model...");
         model
-            .download(Some(|progress: &str| {
-                print!("\r  {progress}");
+            .download(Some(|progress: f64| {
+                print!("\r  {progress:.1}%");
                 io::stdout().flush().ok();
             }))
             .await?;
@@ -250,8 +247,8 @@ fn generate_sine_wave_pcm(sample_rate: i32, duration_seconds: i32, frequency: f6
 
     for i in 0..total_samples {
         let t = i as f64 / sample_rate as f64;
-        let sample = (i16::MAX as f64 * 0.5 * (2.0 * std::f64::consts::PI * frequency * t).sin())
-            as i16;
+        let sample =
+            (i16::MAX as f64 * 0.5 * (2.0 * std::f64::consts::PI * frequency * t).sin()) as i16;
         let bytes = sample.to_le_bytes();
         pcm_bytes[i * 2] = bytes[0];
         pcm_bytes[i * 2 + 1] = bytes[1];
