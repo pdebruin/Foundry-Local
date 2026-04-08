@@ -1,15 +1,17 @@
 // Live Audio Transcription — Foundry Local Rust SDK Example
 //
-// Demonstrates real-time audio-to-text using:
-//   SDK (FoundryLocalManager) → Core (NativeAOT DLL) → onnxruntime-genai (StreamingProcessor)
+// Demonstrates real-time microphone-to-text using:
+//   Microphone (cpal) → SDK → Core (NativeAOT DLL) → onnxruntime-genai (StreamingProcessor)
 //
 // Usage:
-//   cargo run                       # Generates synthetic 440Hz sine wave
-//   cargo run -- path/to/audio.pcm  # Uses raw PCM file (16kHz, 16-bit, mono)
+//   cargo run              # Live microphone transcription (press ENTER to stop)
+//   cargo run -- --synth   # Use synthetic 440Hz sine wave instead of microphone
 
 use std::env;
 use std::io::{self, Write};
+use std::sync::Arc;
 
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use foundry_local_sdk::{FoundryLocalConfig, FoundryLocalManager};
 use tokio_stream::StreamExt;
 
@@ -17,6 +19,8 @@ const ALIAS: &str = "nemotron";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let use_synth = env::args().any(|a| a == "--synth");
+
     println!("===========================================================");
     println!("   Foundry Local -- Live Audio Transcription Demo (Rust)");
     println!("===========================================================");
@@ -28,8 +32,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap()
         .to_path_buf();
 
-    // Try to find e2e-test-pkgs relative to the sample directory first,
-    // then fall back to the exe directory for the core DLL.
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let e2e_pkgs = std::path::PathBuf::from(manifest_dir)
         .join("..")
@@ -85,11 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── 4. Create live transcription session ─────────────────────────────
     let audio_client = model.create_audio_client();
-    let session = audio_client.create_live_transcription_session();
-    // Settings: 16kHz, 16-bit, mono PCM (defaults match)
-    assert_eq!(session.settings.sample_rate, 16000);
-    assert_eq!(session.settings.channels, 1);
-    assert_eq!(session.settings.bits_per_sample, 16);
+    let session = Arc::new(audio_client.create_live_transcription_session());
 
     println!("Starting live transcription session...");
     session.start().await?;
@@ -98,17 +96,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── 5. Start reading transcription results in background ─────────────
     let mut stream = session.get_transcription_stream()?;
     let read_task = tokio::spawn(async move {
-        let mut results = Vec::new();
+        let mut count = 0usize;
         while let Some(result) = stream.next().await {
             match result {
                 Ok(r) => {
                     if r.is_final {
+                        println!();
                         println!("  [FINAL] {}", r.text);
+                        io::stdout().flush().ok();
                     } else if !r.text.is_empty() {
                         print!("{}", r.text);
                         io::stdout().flush().ok();
                     }
-                    results.push(r);
+                    count += 1;
                 }
                 Err(e) => {
                     eprintln!("\n  [ERROR] Stream error: {e}");
@@ -116,69 +116,125 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        results
+        count
     });
 
-    // ── 6. Generate or load PCM audio ────────────────────────────────────
-    let pcm_data = if let Some(pcm_path) = env::args().nth(1) {
-        println!("Reading PCM audio from: {pcm_path}");
-        std::fs::read(&pcm_path)?
+    if use_synth {
+        // ── 6a. Synthetic audio mode ─────────────────────────────────────
+        println!("Generating synthetic PCM audio (440Hz sine wave, 3 seconds)...\n");
+
+        println!("===========================================================");
+        println!("  PUSHING AUDIO → SDK → Core → onnxruntime-genai");
+        println!("===========================================================\n");
+
+        let pcm_data = generate_sine_wave_pcm(16000, 3, 440.0);
+        let chunk_size = 16000 / 10 * 2; // 100ms chunks
+        let mut chunks_pushed = 0;
+        for offset in (0..pcm_data.len()).step_by(chunk_size) {
+            let end = std::cmp::min(offset + chunk_size, pcm_data.len());
+            session.append(&pcm_data[offset..end]).await?;
+            chunks_pushed += 1;
+        }
+        println!("Pushed {chunks_pushed} chunks ({} bytes)", pcm_data.len());
     } else {
-        println!("Generating synthetic PCM audio (440Hz sine wave, 3 seconds)...");
-        generate_sine_wave_pcm(16000, 3, 440.0)
-    };
+        // ── 6b. Live microphone mode ─────────────────────────────────────
+        let host = cpal::default_host();
+        let device = host
+            .default_input_device()
+            .expect("No input audio device available");
+        println!("Microphone: {}", device.name().unwrap_or_default());
 
-    println!(
-        "Audio: {} bytes ({:.1}s at 16kHz/16-bit/mono)\n",
-        pcm_data.len(),
-        pcm_data.len() as f64 / (16000.0 * 2.0)
-    );
+        // Query the device's default input config and adapt
+        let default_config = device.default_input_config()?;
+        println!(
+            "Device default: {} Hz, {} ch, {:?}",
+            default_config.sample_rate().0,
+            default_config.channels(),
+            default_config.sample_format()
+        );
 
-    // ── 7. Push audio in chunks (100ms each) ─────────────────────────────
-    println!("===========================================================");
-    println!("  PUSHING AUDIO → SDK → Core → onnxruntime-genai");
-    println!("===========================================================");
-    println!();
+        let device_rate = default_config.sample_rate().0;
+        let device_channels = default_config.channels();
+        let mic_config: cpal::StreamConfig = default_config.into();
 
-    let chunk_size = 16000 / 10 * 2; // 100ms of 16-bit mono audio = 3200 bytes
-    let mut chunks_pushed = 0;
-    for offset in (0..pcm_data.len()).step_by(chunk_size) {
-        let end = std::cmp::min(offset + chunk_size, pcm_data.len());
-        session.append(&pcm_data[offset..end]).await?;
-        chunks_pushed += 1;
+        let session_for_mic = Arc::clone(&session);
+        let rt = tokio::runtime::Handle::current();
+
+        // Build the stream with the device's native sample format (f32)
+        // and convert to 16kHz/16-bit/mono PCM for the SDK
+        let input_stream = device.build_input_stream(
+            &mic_config,
+            move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                // Step 1: Mix to mono if stereo+
+                let mono: Vec<f32> = if device_channels > 1 {
+                    data.chunks(device_channels as usize)
+                        .map(|frame| frame.iter().sum::<f32>() / device_channels as f32)
+                        .collect()
+                } else {
+                    data.to_vec()
+                };
+
+                // Step 2: Resample to 16kHz if device rate differs
+                let resampled = if device_rate != 16000 {
+                    resample(&mono, device_rate, 16000)
+                } else {
+                    mono
+                };
+
+                // Step 3: Convert f32 → i16 → little-endian bytes
+                let bytes: Vec<u8> = resampled
+                    .iter()
+                    .flat_map(|&s| {
+                        let clamped = s.clamp(-1.0, 1.0);
+                        let sample = (clamped * i16::MAX as f32) as i16;
+                        sample.to_le_bytes()
+                    })
+                    .collect();
+
+                if !bytes.is_empty() {
+                    let session_ref = Arc::clone(&session_for_mic);
+                    rt.spawn(async move {
+                        if let Err(e) = session_ref.append(&bytes).await {
+                            eprintln!("Append error: {e}");
+                        }
+                    });
+                }
+            },
+            |err| eprintln!("Microphone stream error: {err}"),
+            None,
+        )?;
+
+        input_stream.play()?;
+
+        println!();
+        println!("===========================================================");
+        println!("  LIVE TRANSCRIPTION ACTIVE");
+        println!("  Speak into your microphone.");
+        println!("  Transcription appears in real-time.");
+        println!("  Press ENTER to stop recording.");
+        println!("===========================================================");
+        println!();
+
+        // Block until user presses ENTER
+        let mut line = String::new();
+        io::stdin().read_line(&mut line)?;
+
+        drop(input_stream);
+        println!("Microphone stopped.");
     }
-    println!("Pushed {chunks_pushed} chunks ({} bytes total)", pcm_data.len());
 
-    // ── 8. Stop session and wait for results ─────────────────────────────
+    // ── 7. Stop session and wait for results ─────────────────────────────
     println!("\nStopping session (flushing remaining audio)...");
     session.stop().await?;
     println!("✓ Session stopped\n");
 
-    let results = read_task.await?;
+    let result_count = read_task.await?;
 
-    // ── 9. Summary ───────────────────────────────────────────────────────
     println!("===========================================================");
-    println!("  RESULTS SUMMARY");
+    println!("  Total transcription results: {result_count}");
     println!("===========================================================");
-    println!("Total transcription results: {}", results.len());
-    for (i, r) in results.iter().enumerate() {
-        println!(
-            "  [{i}] text={:?} is_final={} start={:?} end={:?}",
-            r.text, r.is_final, r.start_time, r.end_time
-        );
-    }
 
-    if results.is_empty() {
-        println!("  (No transcription results — synthetic audio may not produce recognizable speech)");
-    }
-
-    // Verify all results are well-formed
-    for r in &results {
-        assert_eq!(r.text, r.transcript, "text and transcript must match");
-    }
-    println!("\n✓ All results well-formed (text == transcript)");
-
-    // ── 10. Cleanup ──────────────────────────────────────────────────────
+    // ── 8. Cleanup ───────────────────────────────────────────────────────
     println!("\nUnloading model...");
     model.unload().await?;
     println!("Done.");
@@ -189,7 +245,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Generate synthetic PCM audio (sine wave, 16kHz, 16-bit signed little-endian, mono).
 fn generate_sine_wave_pcm(sample_rate: i32, duration_seconds: i32, frequency: f64) -> Vec<u8> {
     let total_samples = (sample_rate * duration_seconds) as usize;
-    let mut pcm_bytes = vec![0u8; total_samples * 2]; // 16-bit = 2 bytes per sample
+    let mut pcm_bytes = vec![0u8; total_samples * 2];
 
     for i in 0..total_samples {
         let t = i as f64 / sample_rate as f64;
@@ -201,4 +257,23 @@ fn generate_sine_wave_pcm(sample_rate: i32, duration_seconds: i32, frequency: f6
     }
 
     pcm_bytes
+}
+
+/// Simple linear-interpolation resampler (e.g. 48kHz → 16kHz).
+fn resample(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
+    if from_rate == to_rate {
+        return input.to_vec();
+    }
+    let ratio = from_rate as f64 / to_rate as f64;
+    let out_len = (input.len() as f64 / ratio).ceil() as usize;
+    let mut output = Vec::with_capacity(out_len);
+    for i in 0..out_len {
+        let src_idx = i as f64 * ratio;
+        let idx = src_idx as usize;
+        let frac = src_idx - idx as f64;
+        let s0 = input[idx.min(input.len() - 1)];
+        let s1 = input[(idx + 1).min(input.len() - 1)];
+        output.push(s0 + (s1 - s0) * frac as f32);
+    }
+    output
 }
