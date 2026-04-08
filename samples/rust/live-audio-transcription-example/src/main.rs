@@ -90,7 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let session = Arc::new(audio_client.create_live_transcription_session());
 
     println!("Starting live transcription session...");
-    session.start().await?;
+    session.start(None).await?;
     println!("✓ Session started\n");
 
     // ── 5. Start reading transcription results in background ─────────────
@@ -100,12 +100,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         while let Some(result) = stream.next().await {
             match result {
                 Ok(r) => {
+                    let text = &r.content[0].text;
                     if r.is_final {
                         println!();
-                        println!("  [FINAL] {}", r.text);
+                        println!("  [FINAL] {text}");
                         io::stdout().flush().ok();
-                    } else if !r.text.is_empty() {
-                        print!("{}", r.text);
+                    } else if !text.is_empty() {
+                        print!("{text}");
                         io::stdout().flush().ok();
                     }
                     count += 1;
@@ -132,7 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut chunks_pushed = 0;
         for offset in (0..pcm_data.len()).step_by(chunk_size) {
             let end = std::cmp::min(offset + chunk_size, pcm_data.len());
-            session.append(&pcm_data[offset..end]).await?;
+            session.append(&pcm_data[offset..end], None).await?;
             chunks_pushed += 1;
         }
         println!("Pushed {chunks_pushed} chunks ({} bytes)", pcm_data.len());
@@ -194,7 +195,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if !bytes.is_empty() {
                     let session_ref = Arc::clone(&session_for_mic);
                     rt.spawn(async move {
-                        if let Err(e) = session_ref.append(&bytes).await {
+                        if let Err(e) = session_ref.append(&bytes, None).await {
                             eprintln!("Append error: {e}");
                         }
                     });
@@ -225,7 +226,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── 7. Stop session and wait for results ─────────────────────────────
     println!("\nStopping session (flushing remaining audio)...");
-    session.stop().await?;
+    session.stop(None).await?;
     println!("✓ Session stopped\n");
 
     let result_count = read_task.await?;
