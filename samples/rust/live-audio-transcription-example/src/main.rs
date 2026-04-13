@@ -91,7 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("✓ Session started\n");
 
     // ── 5. Start reading transcription results in background ─────────────
-    let mut stream = session.get_transcription_stream()?;
+    let mut stream = session.get_transcription_stream().await?;
     let read_task = tokio::spawn(async move {
         let mut count = 0usize;
         while let Some(result) = stream.next().await {
@@ -142,7 +142,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .expect("No input audio device available");
         println!("Microphone: {}", device.name().unwrap_or_default());
 
-        // Query the device's default input config and adapt
         let default_config = device.default_input_config()?;
         println!(
             "Device default: {} Hz, {} ch, {:?}",
@@ -153,49 +152,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let device_rate = default_config.sample_rate().0;
         let device_channels = default_config.channels();
+        // BufferSize::Default lets the OS/driver choose the optimal buffer
+        // size for the device, typically ~10ms worth of samples.
         let mic_config: cpal::StreamConfig = default_config.into();
 
-        let session_for_mic = Arc::clone(&session);
-        let rt = tokio::runtime::Handle::current();
+        // Use a sync channel to forward audio from the cpal callback thread
+        // to the async runtime. This avoids Arc-cloning the session and
+        // spawning a tokio task per mic callback.
+        let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
 
-        // Build the stream with the device's native sample format (f32)
-        // and convert to 16kHz/16-bit/mono PCM for the SDK
         let input_stream = device.build_input_stream(
             &mic_config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                // Step 1: Mix to mono if stereo+
-                let mono: Vec<f32> = if device_channels > 1 {
-                    data.chunks(device_channels as usize)
-                        .map(|frame| frame.iter().sum::<f32>() / device_channels as f32)
-                        .collect()
-                } else {
-                    data.to_vec()
-                };
-
-                // Step 2: Resample to 16kHz if device rate differs
-                let resampled = if device_rate != 16000 {
-                    resample(&mono, device_rate, 16000)
-                } else {
-                    mono
-                };
-
-                // Step 3: Convert f32 → i16 → little-endian bytes
-                let bytes: Vec<u8> = resampled
-                    .iter()
-                    .flat_map(|&s| {
-                        let clamped = s.clamp(-1.0, 1.0);
-                        let sample = (clamped * i16::MAX as f32) as i16;
-                        sample.to_le_bytes()
-                    })
-                    .collect();
-
+                let bytes = convert_audio(data, device_channels, device_rate);
                 if !bytes.is_empty() {
-                    let session_ref = Arc::clone(&session_for_mic);
-                    rt.spawn(async move {
-                        if let Err(e) = session_ref.append(&bytes, None).await {
-                            eprintln!("Append error: {e}");
-                        }
-                    });
+                    let _ = audio_tx.try_send(bytes);
                 }
             },
             |err| eprintln!("Microphone stream error: {err}"),
@@ -213,11 +184,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("===========================================================");
         println!();
 
+        // Forward audio from channel to the SDK session in a background task
+        let session_for_forward = Arc::clone(&session);
+        let forward_task = tokio::spawn(async move {
+            while let Some(bytes) = audio_rx.recv().await {
+                if let Err(e) = session_for_forward.append(&bytes, None).await {
+                    eprintln!("Append error: {e}");
+                    break;
+                }
+            }
+        });
+
         // Block until user presses ENTER
         let mut line = String::new();
         io::stdin().read_line(&mut line)?;
 
         drop(input_stream);
+        // Close the channel so forward_task exits
+        // (input_stream drop closes cpal → callback stops → audio_tx dropped)
+        forward_task.await?;
         println!("Microphone stopped.");
     }
 
@@ -238,6 +223,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Done.");
 
     Ok(())
+}
+
+/// Convert raw f32 audio samples to 16kHz/mono/16-bit PCM bytes.
+///
+/// Handles stereo-to-mono mixing and sample rate conversion.
+fn convert_audio(data: &[f32], channels: u16, sample_rate: u32) -> Vec<u8> {
+    // Mix to mono if multi-channel
+    let mono: Vec<f32> = if channels > 1 {
+        data.chunks(channels as usize)
+            .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+            .collect()
+    } else {
+        data.to_vec()
+    };
+
+    // Resample to 16kHz if needed
+    let resampled = if sample_rate != 16000 {
+        resample(&mono, sample_rate, 16000)
+    } else {
+        mono
+    };
+
+    // Convert f32 → 16-bit signed little-endian bytes
+    let mut bytes = Vec::with_capacity(resampled.len() * 2);
+    for &s in &resampled {
+        let clamped = s.clamp(-1.0, 1.0);
+        let sample = (clamped * i16::MAX as f32) as i16;
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    bytes
 }
 
 /// Generate synthetic PCM audio (sine wave, 16kHz, 16-bit signed little-endian, mono).
